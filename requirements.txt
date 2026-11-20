@@ -1,0 +1,2 @@
+streamlit>=1.30
+pypinyin>=0.50

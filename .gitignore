@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# 本地个人数据（收藏记录，不发布到公开仓库）
+fandom.db
+fandom.db-journal
+fandom.db-wal
+fandom.db-shm
+*.db
+*.db-journal
+*.csv
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
