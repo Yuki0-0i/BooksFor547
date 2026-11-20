@@ -8,13 +8,10 @@ venv/
 # Streamlit secrets
 .streamlit/secrets.toml
 
-# 本地个人数据（收藏记录，不发布到公开仓库）
-fandom.db
+# 数据文件：fandom.db 按使用者要求随仓库公开（含 7 条初始收藏）
 fandom.db-journal
 fandom.db-wal
 fandom.db-shm
-*.db
-*.db-journal
 *.csv
 
 # 编辑器
