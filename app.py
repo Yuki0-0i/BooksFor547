@@ -16,11 +16,11 @@ import urllib.error
 import urllib.request
 from html.parser import HTMLParser
 import re
-import sqlite3
-from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlencode, urlparse
 
 import streamlit as st
+
+import db
 
 # 汉字标题按拼音排序；若尚未安装，页面会提示运行更新包中的安装脚本。
 try:
@@ -37,7 +37,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-DB_PATH = Path(__file__).resolve().with_name("fandom.db")
 PLATFORMS = ["LOFTER", "AO3", "小红书", "微博", "抖音", "其他"]
 
 # 与页面上的来源筛选保持相同顺序；这里也是默认分组展示顺序。
@@ -88,54 +87,16 @@ def esc(value):
     return html.escape(str(value or ""), quote=True)
 
 
-def connect():
-    return sqlite3.connect(DB_PATH)
-
-
-def init_db():
-    """保留旧收藏；对最初的 V1 数据库进行非破坏性字段兼容。"""
-    with connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS works (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                platform TEXT NOT NULL,
-                url TEXT NOT NULL,
-                tags TEXT DEFAULT '',
-                note TEXT DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        columns = {item[1] for item in conn.execute("PRAGMA table_info(works)")}
-        if "cp" not in columns:
-            conn.execute("ALTER TABLE works ADD COLUMN cp TEXT NOT NULL DEFAULT ''")
-        conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')")
-        if "author" not in columns:
-            conn.execute("ALTER TABLE works ADD COLUMN author TEXT NOT NULL DEFAULT ''")
-        if "created_at" not in columns:
-            # SQLite 不允许在 ALTER TABLE 时增加 CURRENT_TIMESTAMP 默认值。
-            conn.execute("ALTER TABLE works ADD COLUMN created_at TEXT DEFAULT ''")
-            conn.execute(
-                "UPDATE works SET created_at = datetime('now', 'localtime') "
-                "WHERE created_at IS NULL OR created_at = ''"
-            )
-
-
 def get_setting(key, fallback=""):
-    with connect() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-    return row[0] if row else fallback
+    return db.get_setting(key, fallback)
 
 
 def set_setting(key, value):
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
-        )
+    db.set_setting(key, value)
+
+
+def read_works():
+    return db.read_works()
 
 
 def clean_cp(value):
@@ -180,16 +141,6 @@ def cp_catalog(works):
 
 def work_has_cp(work, cp):
     return cp == "全部 CP" or cp.casefold() in {item.casefold() for item in parse_cps(work[8])}
-
-
-def read_works():
-    with connect() as conn:
-        return conn.execute(
-            """
-            SELECT id, title, platform, url, tags, note, created_at, author, cp
-            FROM works ORDER BY id DESC
-            """
-        ).fetchall()
 
 
 def valid_url(url):
@@ -561,7 +512,100 @@ def on_new_link_change():
         st.session_state.pop(key, None)
 
 
-init_db()
+def _friendly_error(ex):
+    text = str(ex)
+    mapping = [
+        ("INVITE_CODE_INVALID", "邀请码无效或已用完，请向管理员索取新的邀请码。"),
+        ("User already registered", "这个邮箱已经注册过了，请直接登录。"),
+        ("Invalid login credentials", "邮箱或密码不正确。"),
+        ("Email not confirmed", "邮箱尚未确认，请联系管理员。"),
+        ("Password should be at least", "密码长度至少 6 位。"),
+        ("New password should be different", "新密码不能与旧密码相同。"),
+    ]
+    for needle, message in mapping:
+        if needle.lower() in text.lower():
+            return message
+    return text
+
+
+if not db.configured():
+    st.error("缺少 Supabase 配置：请设置 SUPABASE_URL 与 SUPABASE_ANON_KEY。")
+    st.stop()
+
+if not db.logged_in():
+    st.markdown(
+        '<div class="hero"><div class="hero-eyebrow">✦ FANDOM ARCHIVE</div>'
+        '<div class="hero-title">🌷 我的同人收藏馆</div>'
+        '<p class="hero-subtitle">请先登录。注册需要管理员发放的邀请码。</p></div>',
+        unsafe_allow_html=True,
+    )
+    tab_login, tab_signup = st.tabs(["🔑 登录", "💌 使用邀请码注册"])
+
+    with tab_login:
+        with st.form("login_form"):
+            login_email = st.text_input("邮箱", key="login_email")
+            login_password = st.text_input("密码", type="password", key="login_password")
+            login_submit = st.form_submit_button(
+                "登录", type="primary", use_container_width=True
+            )
+        if login_submit:
+            if not login_email.strip() or not login_password:
+                st.warning("请填写邮箱和密码。")
+            else:
+                try:
+                    db.sign_in(login_email, login_password)
+                    st.rerun()
+                except Exception as ex:
+                    st.error(_friendly_error(ex))
+
+    with tab_signup:
+        with st.form("signup_form"):
+            invite_code = st.text_input("邀请码 *", key="signup_invite")
+            signup_email = st.text_input("邮箱 *", key="signup_email")
+            signup_password = st.text_input(
+                "密码 *（至少 6 位）", type="password", key="signup_password"
+            )
+            signup_confirm = st.text_input(
+                "确认密码 *", type="password", key="signup_confirm"
+            )
+            signup_submit = st.form_submit_button(
+                "注册并登录", type="primary", use_container_width=True
+            )
+        if signup_submit:
+            if not invite_code.strip():
+                st.warning("请填写邀请码。")
+            elif not signup_email.strip():
+                st.warning("请填写邮箱。")
+            elif len(signup_password) < 6:
+                st.warning("密码至少 6 位。")
+            elif signup_password != signup_confirm:
+                st.warning("两次输入的密码不一致。")
+            else:
+                try:
+                    db.sign_up(signup_email, signup_password, invite_code)
+                    if db.logged_in():
+                        st.rerun()
+                    else:
+                        st.success("注册成功，请直接登录。")
+                except Exception as ex:
+                    st.error(_friendly_error(ex))
+    st.stop()
+
+if not db.is_active():
+    st.error("该账号已被管理员停用。如有疑问请联系管理员。")
+    if st.button("退出登录"):
+        db.sign_out()
+        st.rerun()
+    st.stop()
+
+with st.sidebar:
+    st.markdown("### 🌷 我的收藏馆")
+    st.caption(f"👤 {st.session_state.get('sb_user', {}).get('email', '')}")
+    if db.is_admin():
+        st.page_link("pages/admin.py", label="🛠️ 管理后台", icon="🛠️")
+    if st.button("退出登录", use_container_width=True):
+        db.sign_out()
+        st.rerun()
 
 st.markdown(
     """
@@ -926,11 +970,7 @@ if view == "🌸 我的作品馆":
                                     if st.form_submit_button("保存 CP 和标签", use_container_width=True):
                                         normalized_tags = ", ".join(normalize_selected_tags(edited_tags, category_names))
                                         normalized_cps = ", ".join(normalize_selected_cps(edited_cps, cp_names))
-                                        with connect() as conn:
-                                            conn.execute(
-                                                "UPDATE works SET tags = ?, cp = ? WHERE id = ?",
-                                                (normalized_tags, normalized_cps, work_id),
-                                            )
+                                        db.update_work_tags(work_id, normalized_tags, normalized_cps)
                                         st.session_state["edit_tag_notice"] = title
                                         st.rerun()
                             st.write("")
@@ -953,8 +993,7 @@ if view == "🌸 我的作品馆":
                                 yes, no = st.columns(2)
                                 with yes:
                                     if st.button("确认删除", key=f"yes_{work_id}", type="primary", use_container_width=True):
-                                        with connect() as conn:
-                                            conn.execute("DELETE FROM works WHERE id = ?", (work_id,))
+                                        db.delete_work(work_id)
                                         st.session_state.pop(f"confirm_{work_id}", None)
                                         st.session_state["delete_notice"] = True
                                         st.rerun()
@@ -1012,11 +1051,7 @@ else:
                 "💞 给旧收藏补充常用 CP（只补空白）",
                 key="fill_old_cp", disabled=not confirmed, use_container_width=True,
             ):
-                with connect() as conn:
-                    conn.execute(
-                        "UPDATE works SET cp = ? WHERE TRIM(COALESCE(cp, '')) = ''",
-                        (default_cp,),
-                    )
+                db.fill_blank_cp(default_cp)
                 st.session_state["fill_old_cp_notice"] = True
                 st.rerun()
     if st.session_state.pop("fill_old_cp_notice", False):
@@ -1168,21 +1203,24 @@ else:
             if repeated:
                 st.warning(f"💌 这条作品已经收藏过：《{repeated[1]}》，没有重复保存。")
             else:
-                with connect() as conn:
-                    conn.execute(
-                        "INSERT INTO works (title, platform, url, tags, note, author, cp) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (title, platform, clean_url,
-                         ", ".join(normalize_selected_tags(tags, [name for name, _ in categories])),
-                         note.strip(), author.strip(), ", ".join(normalize_selected_cps(selected_cps, cp_names))),
-                    )
+                db.insert_work(
+                    title,
+                    platform,
+                    clean_url,
+                    ", ".join(normalize_selected_tags(tags, [name for name, _ in categories])),
+                    note.strip(),
+                    author.strip(),
+                    ", ".join(normalize_selected_cps(selected_cps, cp_names)),
+                )
                 st.session_state["save_notice"] = True
                 st.session_state["clear_add_work"] = True
                 st.rerun()
 
 st.markdown(
-    '<div class="footnote">🌷 这是你私人的本地收藏馆。作品链接、分类和笔记保存在同一文件夹的 '
-    '<b>fandom.db</b> 中；升级时请保留此文件，并定期导出 CSV 备份。'
-    '<br>📱 手机与电脑连接同一可信任 Wi‑Fi 后，可通过电脑的 Network URL 访问；手机收藏会直接写入电脑数据库。'
+    '<div class="footnote">🌷 这是你的私人收藏馆。作品链接、分类和笔记保存在云端数据库（Supabase）中，'
+    '只有你自己能看到；请定期用「导出 CSV」做备份。'
+    '<br>🔐 账号由管理员通过邀请码发放；若忘记密码或需要更多邀请码，请联系管理员。'
+    '<br>📱 手机与电脑都可访问同一个网址，数据实时同步到云端。'
     '<br>💞 CP 标签也支持历史多选、新增和常用 CP 默认勾选；与作品类型标签独立。旧 CP 数据会被正常识别。'
     '<br>🏷️ 作品类型标签可多选历史选项，也能输入新标签；一篇作品可属于多个分类。'
     '<br>作者自动识别只读取公开网页信息，部分网站可能拒绝访问，仍可手动填写；短链接与原链接不一定能互相查重。</div>',
